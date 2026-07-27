@@ -31,7 +31,7 @@ The closure body is the runtime entrypoint the backend calls after `init`.
 Version safety is two-layered:
 
 - **Compile time** (`lib.rs:47`):
-  `const _: () = assert!(laufey::LAUFEY_API_VERSION == 30, …)`. If the linked
+  `const _: () = assert!(laufey::LAUFEY_API_VERSION == 31, …)`. If the linked
   `laufey` crate's ABI version drifts from what the shipped backend speaks,
   `cargo build` fails loudly instead of producing a dylib that silently won't
   launch.
@@ -41,6 +41,17 @@ Version safety is two-layered:
   — no TOFU on the GitHub releases page. `LaufeyBackendResolver` resolves in
   order: `LAUFEY_DEV_DIR` checkout → versioned backend bundled beside Deno →
   cached download → fresh download.
+
+The raw backend exposes native cursor grabs through
+`BrowserWindow.setCursorGrab()`. `"confined"` keeps the visible system cursor
+inside the window and preserves ordinary absolute mouse events. `"locked"` hides
+the cursor and forwards winit `DeviceEvent::MouseMotion` as `mousemove` events
+with `movementX` / `movementY`. The returned promise reports native request
+acceptance. Wayland locked mode first checks for pointer-constraints and
+relative-pointer support on winit's display connection, but compositor
+activation remains asynchronous and is not exposed by winit. Acquisition
+requires focus and the cursor to be inside the window. Any grab is released
+automatically when the window loses focus or closes.
 
 The dylib finds _itself_ on disk via `dladdr` on one of its own functions
 (`get_dylib_path`, `lib.rs:986`) — needed for the auto-update sentinel and for

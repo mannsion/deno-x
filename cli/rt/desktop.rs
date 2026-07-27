@@ -11,6 +11,7 @@ use std::sync::Arc;
 use deno_core::OpState;
 // Re-export from runtime so denort_desktop can use them.
 pub use deno_runtime::ops::desktop::AutoUpdateState;
+pub use deno_runtime::ops::desktop::CursorGrabMode;
 pub use deno_runtime::ops::desktop::DesktopApi;
 pub use deno_runtime::ops::desktop::MenuItem;
 
@@ -39,6 +40,7 @@ pub const DESKTOP_JS: &str = r#"
   Object.setPrototypeOf(BrowserWindowPrototype, EventTarget.prototype);
   const privateDesktopBind = Symbol.for("Deno_privateDesktopBind");
   const privateDesktopUnbind = Symbol.for("Deno_privateDesktopUnbind");
+  const privateDesktopClose = Symbol.for("Deno_privateDesktopClose");
 
   class UIEvent extends Event {
     #detail = 0;
@@ -114,6 +116,8 @@ pub const DESKTOP_JS: &str = r#"
     #button = 0;
     #clientX = 0;
     #clientY = 0;
+    #movementX = 0;
+    #movementY = 0;
     #ctrlKey = false;
     #shiftKey = false;
     #altKey = false;
@@ -122,6 +126,8 @@ pub const DESKTOP_JS: &str = r#"
     get button() { return this.#button; }
     get clientX() { return this.#clientX; }
     get clientY() { return this.#clientY; }
+    get movementX() { return this.#movementX; }
+    get movementY() { return this.#movementY; }
     get screenX() { return this.#clientX; }
     get screenY() { return this.#clientY; }
     get ctrlKey() { return this.#ctrlKey; }
@@ -134,6 +140,8 @@ pub const DESKTOP_JS: &str = r#"
       this.#button = init.button ?? 0;
       this.#clientX = init.clientX ?? 0;
       this.#clientY = init.clientY ?? 0;
+      this.#movementX = init.movementX ?? 0;
+      this.#movementY = init.movementY ?? 0;
       this.#ctrlKey = init.ctrlKey ?? false;
       this.#shiftKey = init.shiftKey ?? false;
       this.#altKey = init.altKey ?? false;
@@ -178,16 +186,38 @@ pub const DESKTOP_JS: &str = r#"
 
   // Window registry: windowId -> BrowserWindow instance.
   const windows = new Map();
+  const windowIds = new WeakMap();
+  // Last delivered absolute mousemove, used only for movementX/Y continuity.
+  const mousePositions = new Map();
+  // Latest position carried by any native pointer event.
+  const cursorPositions = new Map();
+  // Fixed client coordinate for each current raw-motion sequence.
+  const rawMotionPositions = new Map();
+  // Preserve the raw-to-absolute transition even if another pointer event
+  // refreshes the fixed coordinate before the first absolute move.
+  const rawMotionWindows = new Set();
   const nativeConstructor = BrowserWindow;
   const OrigBW = function(...args) {
     const instance = new nativeConstructor(...args);
     const windowId = instance.windowId;
     windows.set(windowId, instance);
+    windowIds.set(instance, windowId);
     return instance;
   };
   Object.setPrototypeOf(OrigBW, nativeConstructor);
   Object.setPrototypeOf(OrigBW.prototype, nativeConstructor.prototype);
   Deno.BrowserWindow = OrigBW;
+
+  BrowserWindowPrototype.close = function() {
+    const windowId = windowIds.get(this);
+    BrowserWindowPrototype[privateDesktopClose].call(this);
+    if (windowId !== undefined) {
+      mousePositions.delete(windowId);
+      cursorPositions.delete(windowId);
+      rawMotionPositions.delete(windowId);
+      rawMotionWindows.delete(windowId);
+    }
+  };
 
   internals.defineEventHandler(BrowserWindowPrototype, "keydown");
   internals.defineEventHandler(BrowserWindowPrototype, "keyup");
@@ -838,6 +868,8 @@ pub const DESKTOP_JS: &str = r#"
           case "mouseClick": {
             const target = windows.get(ev.windowId);
             if (!target) break;
+            cursorPositions.set(ev.windowId, [ev.clientX, ev.clientY]);
+            rawMotionPositions.delete(ev.windowId);
             const init = {
               button: ev.button,
               clientX: ev.clientX,
@@ -864,9 +896,40 @@ pub const DESKTOP_JS: &str = r#"
           case "mouseMove": {
             const target = windows.get(ev.windowId);
             if (!target) break;
+            const previous = mousePositions.get(ev.windowId);
+            const wasRaw = rawMotionWindows.delete(ev.windowId);
+            rawMotionPositions.delete(ev.windowId);
+            const movementX = previous && !wasRaw ? ev.clientX - previous[0] : 0;
+            const movementY = previous && !wasRaw ? ev.clientY - previous[1] : 0;
+            mousePositions.set(ev.windowId, [ev.clientX, ev.clientY]);
+            cursorPositions.set(ev.windowId, [ev.clientX, ev.clientY]);
             target.dispatchEvent(new MouseEvent("mousemove", {
               clientX: ev.clientX,
               clientY: ev.clientY,
+              movementX,
+              movementY,
+              ctrlKey: ev.control,
+              shiftKey: ev.shift,
+              altKey: ev.alt,
+              metaKey: ev.meta,
+            }));
+            break;
+          }
+          case "mouseMotion": {
+            const target = windows.get(ev.windowId);
+            if (!target) break;
+            rawMotionWindows.add(ev.windowId);
+            let position = rawMotionPositions.get(ev.windowId);
+            if (!position) {
+              position = cursorPositions.get(ev.windowId) ?? [0, 0];
+              rawMotionPositions.set(ev.windowId, position);
+            }
+            const [clientX, clientY] = position;
+            target.dispatchEvent(new MouseEvent("mousemove", {
+              clientX,
+              clientY,
+              movementX: ev.movementX,
+              movementY: ev.movementY,
               ctrlKey: ev.control,
               shiftKey: ev.shift,
               altKey: ev.alt,
@@ -877,6 +940,8 @@ pub const DESKTOP_JS: &str = r#"
           case "wheel": {
             const target = windows.get(ev.windowId);
             if (!target) break;
+            cursorPositions.set(ev.windowId, [ev.clientX, ev.clientY]);
+            rawMotionPositions.delete(ev.windowId);
             target.dispatchEvent(new WheelEvent("wheel", {
               deltaX: ev.deltaX,
               deltaY: ev.deltaY,
@@ -893,6 +958,15 @@ pub const DESKTOP_JS: &str = r#"
           case "cursorEnterLeave": {
             const target = windows.get(ev.windowId);
             if (!target) break;
+            if (ev.entered) {
+              cursorPositions.set(ev.windowId, [ev.clientX, ev.clientY]);
+              rawMotionPositions.delete(ev.windowId);
+            } else {
+              mousePositions.delete(ev.windowId);
+              cursorPositions.delete(ev.windowId);
+              rawMotionPositions.delete(ev.windowId);
+              rawMotionWindows.delete(ev.windowId);
+            }
             const init = {
               clientX: ev.clientX,
               clientY: ev.clientY,
@@ -908,6 +982,12 @@ pub const DESKTOP_JS: &str = r#"
           case "focusChanged": {
             const target = windows.get(ev.windowId);
             if (!target) break;
+            if (!ev.focused) {
+              mousePositions.delete(ev.windowId);
+              cursorPositions.delete(ev.windowId);
+              rawMotionPositions.delete(ev.windowId);
+              rawMotionWindows.delete(ev.windowId);
+            }
             target.dispatchEvent(new FocusEvent(ev.focused ? "focus" : "blur"));
             break;
           }
@@ -934,6 +1014,10 @@ pub const DESKTOP_JS: &str = r#"
             break;
           }
           case "closeRequested": {
+            mousePositions.delete(ev.windowId);
+            cursorPositions.delete(ev.windowId);
+            rawMotionPositions.delete(ev.windowId);
+            rawMotionWindows.delete(ev.windowId);
             const target = windows.get(ev.windowId);
             if (!target) break;
             target.dispatchEvent(new Event("close"));
@@ -1390,6 +1474,16 @@ mod tests {
   }
 
   #[test]
+  fn desktop_js_dispatches_relative_mouse_motion() {
+    assert!(DESKTOP_JS.contains("case \"mouseMotion\""));
+    assert!(DESKTOP_JS.contains("movementX: ev.movementX"));
+    assert!(DESKTOP_JS.contains("movementY: ev.movementY"));
+    assert!(DESKTOP_JS.contains("rawMotionPositions.get(ev.windowId)"));
+    assert!(DESKTOP_JS.contains("cursorPositions.get(ev.windowId)"));
+    assert_eq!(DESKTOP_JS.matches("mousePositions.set").count(), 1);
+  }
+
+  #[test]
   fn desktop_js_installs_notification_permission_getter() {
     // Notification.permission is a synchronous spec-mandated getter.
     // A regression that turned the property definition into a plain
@@ -1485,6 +1579,9 @@ mod tests {
     assert!(DESKTOP_JS.contains(
       "const privateDesktopUnbind = Symbol.for(\"Deno_privateDesktopUnbind\")"
     ));
+    assert!(DESKTOP_JS.contains(
+      "const privateDesktopClose = Symbol.for(\"Deno_privateDesktopClose\")"
+    ));
     assert!(
       DESKTOP_JS.contains(
         "BrowserWindowPrototype[privateDesktopBind].call(this, name)"
@@ -1493,6 +1590,10 @@ mod tests {
     assert!(DESKTOP_JS.contains(
       "BrowserWindowPrototype[privateDesktopUnbind].call(this, name)"
     ));
+    assert!(
+      DESKTOP_JS
+        .contains("BrowserWindowPrototype[privateDesktopClose].call(this)")
+    );
     assert!(DESKTOP_JS.contains("Deno_privateDesktopTrayDestroy"));
     assert!(
       DESKTOP_JS

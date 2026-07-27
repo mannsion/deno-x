@@ -44,13 +44,13 @@ use denort::run::RunOptions;
 /// makes the failure mode obvious instead of "the desktop app silently won't
 /// launch".
 const _: () = assert!(
-  laufey::LAUFEY_API_VERSION == 34,
-  "LAUFEY_API_VERSION mismatch: update this assert and the prebuilt backend release pin in cli/tools/desktop.rs when laufey bumps its API version",
+  laufey::LAUFEY_API_VERSION == 35,
+  "LAUFEY_API_VERSION mismatch: update this assert and the bundled/downloaded backend release pin when laufey bumps its API version",
 );
 
 /// Laufey-backed implementation of [`denort::desktop::DesktopApi`].
 struct WefDesktopApi {
-  event_tx: deno_runtime::ops::desktop::DesktopEventTx,
+  event_tx: deno_runtime::ops::desktop::DesktopEventSender,
   pending_responses: deno_runtime::ops::desktop::PendingBindResponses,
   closed_windows: Arc<Mutex<HashSet<u32>>>,
   /// IDs of every window currently displayed. Shared with the HMR reload
@@ -74,6 +74,7 @@ impl WefDesktopApi {
     let kb_tx = self.event_tx.clone();
     let mouse_click_tx = self.event_tx.clone();
     let mouse_move_tx = self.event_tx.clone();
+    let mouse_motion_tx = self.event_tx.clone();
     let wheel_tx = self.event_tx.clone();
     let cursor_tx = self.event_tx.clone();
     let focus_tx = self.event_tx.clone();
@@ -136,6 +137,19 @@ impl WefDesktopApi {
             window_id: ev.window_id,
             client_x: ev.x,
             client_y: ev.y,
+            shift: ev.modifiers.shift,
+            control: ev.modifiers.control,
+            alt: ev.modifiers.alt,
+            meta: ev.modifiers.meta,
+          },
+        );
+      })
+      .on_mouse_motion(move |ev| {
+        let _ = mouse_motion_tx.try_send(
+          deno_runtime::ops::desktop::DesktopEvent::MouseMotion {
+            window_id: ev.window_id,
+            movement_x: ev.delta_x,
+            movement_y: ev.delta_y,
             shift: ev.modifiers.shift,
             control: ev.modifiers.control,
             alt: ev.modifiers.alt,
@@ -356,6 +370,22 @@ impl denort::desktop::DesktopApi for WefDesktopApi {
     laufey::Window::from_id(window_id).focus();
   }
 
+  fn set_cursor_grab(
+    &self,
+    window_id: u32,
+    mode: denort::desktop::CursorGrabMode,
+    callback: Box<dyn FnOnce(bool) + Send + 'static>,
+  ) {
+    let mode = match mode {
+      denort::desktop::CursorGrabMode::None => laufey::CursorGrabMode::None,
+      denort::desktop::CursorGrabMode::Confined => {
+        laufey::CursorGrabMode::Confined
+      }
+      denort::desktop::CursorGrabMode::Locked => laufey::CursorGrabMode::Locked,
+    };
+    laufey::Window::from_id(window_id).set_cursor_grab(mode, callback);
+  }
+
   fn open_devtools(&self, window_id: u32, renderer: bool, deno: bool) {
     if let Ok(mux) = env::var("DENO_DESKTOP_MUX_WS") {
       // Reuse an existing DevTools window when one is already open, so
@@ -466,7 +496,7 @@ impl denort::desktop::DesktopApi for WefDesktopApi {
             args,
             call_id,
           };
-          if let Err(err) = tx.try_send(event) {
+          if let Err(err) = tx.0.try_send(event) {
             let msg = match err {
               tokio::sync::mpsc::error::TrySendError::Full(_) => {
                 "event channel saturated".to_string()
@@ -1865,7 +1895,7 @@ async fn run_desktop(
         denort::desktop::create_desktop_event_channel();
       let pending_responses = denort::desktop::PendingBindResponses::new();
       let api = WefDesktopApi {
-        event_tx: event_tx.0.clone(),
+        event_tx: event_tx.clone(),
         pending_responses: pending_responses.clone(),
         closed_windows: Arc::new(Mutex::new(HashSet::new())),
         open_windows: open_windows_for_api.clone(),
@@ -1878,7 +1908,7 @@ async fn run_desktop(
       // no windows are visible) into the shared event channel so JS can
       // observe them as `Deno.dock` "reopen" events.
       {
-        let reopen_tx = event_tx.0.clone();
+        let reopen_tx = event_tx.clone();
         laufey::on_dock_reopen(move |has_visible_windows| {
           let _ = reopen_tx.try_send(
             deno_runtime::ops::desktop::DesktopEvent::DockReopen {

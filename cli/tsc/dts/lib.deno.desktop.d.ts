@@ -59,6 +59,8 @@ declare interface MouseEventInit extends UIEventInit {
   button?: number;
   clientX?: number;
   clientY?: number;
+  movementX?: number;
+  movementY?: number;
   ctrlKey?: boolean;
   shiftKey?: boolean;
   altKey?: boolean;
@@ -70,6 +72,8 @@ declare class MouseEvent extends UIEvent {
   readonly button: number;
   readonly clientX: number;
   readonly clientY: number;
+  readonly movementX: number;
+  readonly movementY: number;
   readonly screenX: number;
   readonly screenY: number;
   readonly ctrlKey: boolean;
@@ -428,6 +432,14 @@ declare namespace Deno {
     transparent?: boolean;
   }
 
+  /** Native cursor grab behavior for a {@linkcode BrowserWindow}.
+   *
+   * - `"none"` releases any active grab.
+   * - `"confined"` keeps the visible system cursor inside the window.
+   * - `"locked"` hides the cursor and delivers unbounded relative motion.
+   */
+  export type CursorGrabMode = "none" | "confined" | "locked";
+
   interface BrowserWindowObject {
     [key: string]: BrowserWindowValue;
   }
@@ -649,6 +661,26 @@ declare namespace Deno {
     show(): void;
     hide(): void;
     focus(): void;
+    /** Apply native cursor confinement or pointer lock.
+     *
+     * `"confined"` leaves the normal system cursor visible and moving normally,
+     * but prevents it from leaving the window. `"locked"` hides the cursor and
+     * makes `mousemove` events carry unbounded relative motion in
+     * {@linkcode MouseEvent.movementX} and {@linkcode MouseEvent.movementY}.
+     * `"none"` releases either mode.
+     *
+     * Acquisition requires the raw desktop backend, keyboard focus, and the
+     * cursor to be inside the window. Mode support is platform-dependent;
+     * current macOS raw builds do not support `"confined"`.
+     *
+     * The promise resolves when the native backend accepts the request and
+     * rejects when local preconditions fail or the native API rejects the mode.
+     * Wayland locked mode requires both pointer-constraints and relative-pointer
+     * protocol support. Compositor activation happens asynchronously and is not
+     * confirmed by resolution of this promise. Any grab is released automatically
+     * when the window loses focus or closes.
+     */
+    setCursorGrab(mode: CursorGrabMode): Promise<void>;
     navigate(url: string): void;
     /** Open a DevTools window.
      *

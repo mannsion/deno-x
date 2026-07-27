@@ -309,6 +309,14 @@ pub struct OpenDevtoolsOptions {
   pub deno: Option<bool>,
 }
 
+#[derive(Clone, Copy, Debug, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum CursorGrabMode {
+  None,
+  Confined,
+  Locked,
+}
+
 /// A single event type that flows from the laufey backend to the Deno runtime.
 #[derive(Debug, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
@@ -354,6 +362,16 @@ pub enum DesktopEvent {
     window_id: u32,
     client_x: f64,
     client_y: f64,
+    shift: bool,
+    control: bool,
+    alt: bool,
+    meta: bool,
+  },
+  #[serde(rename_all = "camelCase")]
+  MouseMotion {
+    window_id: u32,
+    movement_x: f64,
+    movement_y: f64,
     shift: bool,
     control: bool,
     alt: bool,
@@ -431,6 +449,9 @@ pub enum DesktopEvent {
 /// (the channel was previously unbounded). When full, low-priority events
 /// (motion / wheel) are dropped via `try_send` and a warning is logged.
 const DESKTOP_EVENT_CHANNEL_CAPACITY: usize = 1024;
+/// Keep room for ordered lifecycle and button/key events even while a
+/// high-polling-rate mouse is producing motion faster than JS can consume it.
+const DESKTOP_EVENT_CONTROL_RESERVE: usize = 64;
 
 type DesktopEventRx =
   tokio::sync::Mutex<tokio::sync::mpsc::Receiver<DesktopEvent>>;
@@ -443,15 +464,27 @@ pub struct DesktopEventSender(pub DesktopEventTx);
 impl DesktopEventSender {
   /// Send an event, dropping it on backpressure rather than blocking or
   /// allocating. Use this for high-frequency events (mouse move, wheel).
-  pub fn try_send(&self, event: DesktopEvent) {
-    if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) =
-      self.0.try_send(event)
+  pub fn try_send(&self, event: DesktopEvent) -> bool {
+    if matches!(
+      &event,
+      DesktopEvent::MouseMove { .. }
+        | DesktopEvent::MouseMotion { .. }
+        | DesktopEvent::Wheel { .. }
+    ) && self.0.capacity() <= DESKTOP_EVENT_CONTROL_RESERVE
     {
-      // Log once per overflow burst would be ideal, but a plain warn is fine
-      // here — this only fires on pathological event rates.
-      log::warn!(
-        "desktop event channel full; dropping event (renderer producing events faster than runtime can drain)"
-      );
+      return false;
+    }
+    match self.0.try_send(event) {
+      Ok(()) => true,
+      Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+        // Log once per overflow burst would be ideal, but a plain warn is fine
+        // here — this only fires on pathological control-event rates.
+        log::warn!(
+          "desktop event channel full; dropping event (renderer producing events faster than runtime can drain)"
+        );
+        false
+      }
+      Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
     }
   }
 }
@@ -558,6 +591,15 @@ pub trait DesktopApi: Send + Sync + 'static {
   fn show(&self, window_id: u32);
   fn hide(&self, window_id: u32);
   fn focus(&self, window_id: u32);
+  /// Request a native cursor grab. The callback runs exactly once and reports
+  /// whether the native API accepted it. Wayland compositor activation may
+  /// happen later.
+  fn set_cursor_grab(
+    &self,
+    window_id: u32,
+    mode: CursorGrabMode,
+    callback: Box<dyn FnOnce(bool) + Send + 'static>,
+  );
 
   fn bind(&self, window_id: u32, name: &str);
   fn unbind(&self, window_id: u32, name: &str);
@@ -925,6 +967,7 @@ impl BrowserWindow {
   }
 
   #[fast]
+  #[symbol("Deno_privateDesktopClose")]
   fn close(&self) {
     if self.surface_taken.get() {
       // A WebGPU surface is referencing this window's native handles.
@@ -957,6 +1000,36 @@ impl BrowserWindow {
   #[fast]
   fn focus(&self) {
     self.api.focus(self.window_id);
+  }
+
+  async fn set_cursor_grab(
+    &self,
+    #[serde] mode: CursorGrabMode,
+  ) -> Result<(), deno_error::JsErrorBox> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    self.api.set_cursor_grab(
+      self.window_id,
+      mode,
+      Box::new(move |success| {
+        let _ = tx.send(success);
+      }),
+    );
+    let success = rx.await.map_err(|_| {
+      deno_error::JsErrorBox::generic("cursor grab callback dropped")
+    })?;
+    if success {
+      Ok(())
+    } else {
+      Err(deno_error::JsErrorBox::generic(match mode {
+        CursorGrabMode::None => "failed to release cursor grab",
+        CursorGrabMode::Confined => {
+          "failed to confine cursor; this requires the raw desktop backend, a focused window with the cursor inside it, and platform cursor-confinement support"
+        }
+        CursorGrabMode::Locked => {
+          "failed to lock cursor; this requires the raw desktop backend, a focused window with the cursor inside it, and platform pointer-lock support"
+        }
+      }))
+    }
   }
 
   #[fast]
@@ -2213,12 +2286,15 @@ mod tests {
   use deno_core::serde_json::json;
 
   use super::BrowserWindow;
+  use super::CursorGrabMode;
+  use super::DESKTOP_EVENT_CONTROL_RESERVE;
   use super::DesktopEvent;
   use super::DesktopValue;
   use super::MenuItem;
   use super::PendingBindResponses;
   use super::PermissionState;
   use super::Tray;
+  use super::create_desktop_event_channel;
   use super::dylib_magic_ok;
   use super::permission_state_to_web_string;
   use super::register_bind_call;
@@ -2232,11 +2308,34 @@ mod tests {
   // packaged app.
 
   #[test]
+  fn cursor_grab_mode_uses_public_string_values() {
+    assert_eq!(
+      serde_json::from_value::<CursorGrabMode>(json!("none")).unwrap(),
+      CursorGrabMode::None
+    );
+    assert_eq!(
+      serde_json::from_value::<CursorGrabMode>(json!("confined")).unwrap(),
+      CursorGrabMode::Confined
+    );
+    assert_eq!(
+      serde_json::from_value::<CursorGrabMode>(json!("locked")).unwrap(),
+      CursorGrabMode::Locked
+    );
+    assert!(
+      serde_json::from_value::<CursorGrabMode>(json!("invalid")).is_err()
+    );
+  }
+
+  #[test]
   fn js_wrapped_desktop_methods_use_private_symbols() {
     for (object, methods) in [
       (
         BrowserWindow::DECL,
-        &["Deno_privateDesktopBind", "Deno_privateDesktopUnbind"][..],
+        &[
+          "Deno_privateDesktopBind",
+          "Deno_privateDesktopUnbind",
+          "Deno_privateDesktopClose",
+        ][..],
       ),
       (Tray::DECL, &["Deno_privateDesktopTrayDestroy"][..]),
     ] {
@@ -2255,7 +2354,7 @@ mod tests {
     }
 
     for (object, public_names) in [
-      (BrowserWindow::DECL, &["bind", "unbind"][..]),
+      (BrowserWindow::DECL, &["bind", "unbind", "close"][..]),
       (Tray::DECL, &["destroy"][..]),
     ] {
       for name in public_names {
@@ -2375,6 +2474,41 @@ mod tests {
     assert_eq!(v["clientX"], 10.5);
     assert_eq!(v["clientY"], 20.25);
     assert_eq!(v["clickCount"], 1);
+  }
+
+  #[test]
+  fn mouse_motion_uses_movement_xy() {
+    let v = serde_json::to_value(DesktopEvent::MouseMotion {
+      window_id: 1,
+      movement_x: -4.5,
+      movement_y: 2.25,
+      shift: false,
+      control: false,
+      alt: false,
+      meta: false,
+    })
+    .unwrap();
+    assert_eq!(v["kind"], "mouseMotion");
+    assert_eq!(v["movementX"], -4.5);
+    assert_eq!(v["movementY"], 2.25);
+  }
+
+  #[test]
+  fn motion_events_reserve_capacity_for_control_events() {
+    let (sender, _receiver) = create_desktop_event_channel();
+    let motion = || DesktopEvent::MouseMotion {
+      window_id: 1,
+      movement_x: 1.0,
+      movement_y: 1.0,
+      shift: false,
+      control: false,
+      alt: false,
+      meta: false,
+    };
+    while sender.try_send(motion()) {}
+    assert_eq!(sender.0.capacity(), DESKTOP_EVENT_CONTROL_RESERVE);
+    assert!(sender.try_send(DesktopEvent::CloseRequested { window_id: 1 }));
+    assert_eq!(sender.0.capacity(), DESKTOP_EVENT_CONTROL_RESERVE - 1);
   }
 
   #[test]
@@ -2529,6 +2663,18 @@ mod tests {
         meta: false,
       }),
       "mouseMove"
+    );
+    assert_eq!(
+      kind_of(DesktopEvent::MouseMotion {
+        window_id: 0,
+        movement_x: 0.0,
+        movement_y: 0.0,
+        shift: false,
+        control: false,
+        alt: false,
+        meta: false,
+      }),
+      "mouseMotion"
     );
     assert_eq!(
       kind_of(DesktopEvent::Wheel {
