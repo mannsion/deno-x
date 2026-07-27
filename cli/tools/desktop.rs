@@ -25,8 +25,9 @@ use crate::util::progress_bar::ProgressBar;
 use crate::util::progress_bar::ProgressBarStyle;
 
 /// Version of the `laufey` capi crate pinned in the workspace Cargo.lock.
-/// Populated by `cli/build.rs` and used to resolve matching prebuilt backend
-/// binaries from `github.com/littledivy/laufey/releases/tag/v{LAUFEY_VERSION}`.
+/// Populated by `cli/build.rs` and used to resolve matching bundled or prebuilt
+/// backend binaries from
+/// `github.com/littledivy/laufey/releases/tag/v{LAUFEY_VERSION}`.
 const LAUFEY_VERSION: &str = env!("LAUFEY_VERSION");
 
 /// Rustc target triple the deno binary was built for. Used as the default
@@ -1905,20 +1906,27 @@ async fn package_linux_app_dir(
 const LAUFEY_DEV_DIR_ENV: &str = "LAUFEY_DEV_DIR";
 
 /// Resolves LAUFEY backend binaries and `.app` bundles, falling back to
-/// downloading prebuilt archives from the laufey GitHub releases when
-/// `LAUFEY_DEV_DIR` is not set.
+/// downloading prebuilt archives from the laufey GitHub releases when no
+/// development or bundled backend is available.
 struct LaufeyBackendResolver {
   http_client_provider: Arc<HttpClientProvider>,
+  /// `<resolved-deno-exe-dir>/laufey/<version>/`
+  bundled_root: Option<PathBuf>,
   /// `<deno_dir>/laufey/<version>/`
   cache_root: PathBuf,
 }
 
 impl LaufeyBackendResolver {
   fn new(factory: &CliFactory) -> Result<Self, AnyError> {
+    let bundled_root = std::env::current_exe().ok().and_then(|exe| {
+      let exe = crate::util::fs::canonicalize_path(&exe).unwrap_or(exe);
+      bundled_laufey_root_for_exe(&exe)
+    });
     let cache_root =
       factory.deno_dir()?.root.join("laufey").join(LAUFEY_VERSION);
     Ok(Self {
       http_client_provider: factory.http_client_provider().clone(),
+      bundled_root,
       cache_root,
     })
   }
@@ -2077,8 +2085,8 @@ impl LaufeyBackendResolver {
 
   /// Locate the LAUFEY backend binary for `backend` on `target`.
   ///
-  /// Resolution order: `LAUFEY_DEV_DIR` checkout → cached download →
-  /// fresh download.
+  /// Resolution order: `LAUFEY_DEV_DIR` checkout → bundled backend beside the
+  /// running Deno executable → cached download → fresh download.
   async fn find_binary(
     &self,
     backend: &str,
@@ -2110,6 +2118,22 @@ impl LaufeyBackendResolver {
       return Ok(binary);
     }
 
+    if let Some(dir) =
+      bundled_backend_dir(self.bundled_root.as_deref(), backend, target)
+    {
+      let binary = locate_backend_binary(&dir, backend, target).ok_or_else(|| {
+        deno_core::anyhow::anyhow!(
+          "bundled '{backend}' backend directory {} does not contain its expected binary for target '{target}'",
+          dir.display(),
+        )
+      })?;
+      log::debug!(
+        "Using bundled laufey {backend} backend at {}",
+        binary.display()
+      );
+      return Ok(binary);
+    }
+
     let dir = self.ensure_downloaded(backend, target).await?;
     locate_backend_binary(&dir, backend, target).ok_or_else(|| {
       deno_core::anyhow::anyhow!(
@@ -2131,6 +2155,17 @@ impl LaufeyBackendResolver {
           "could not find '{backend}' .app bundle under {} (set via {})",
           dev_dir.display(),
           LAUFEY_DEV_DIR_ENV
+        )
+      });
+    }
+
+    if let Some(dir) =
+      bundled_backend_dir(self.bundled_root.as_deref(), backend, target)
+    {
+      return locate_app_bundle(&dir, backend).ok_or_else(|| {
+        deno_core::anyhow::anyhow!(
+          "bundled '{backend}' backend directory {} does not contain its expected .app bundle for target '{target}'",
+          dir.display(),
         )
       });
     }
@@ -2364,6 +2399,19 @@ fn locate_app_bundle(dir: &Path, backend: &str) -> Option<PathBuf> {
   };
   let p = dir.join(name);
   p.exists().then_some(p)
+}
+
+fn bundled_laufey_root_for_exe(exe: &Path) -> Option<PathBuf> {
+  Some(exe.parent()?.join("laufey").join(LAUFEY_VERSION))
+}
+
+fn bundled_backend_dir(
+  bundled_root: Option<&Path>,
+  backend: &str,
+  target: &str,
+) -> Option<PathBuf> {
+  let dir = bundled_root?.join(backend).join(target);
+  dir.is_dir().then_some(dir)
 }
 
 /// Target triple to use when selecting a laufey backend archive. Honors
@@ -7074,7 +7122,49 @@ def456  other.zip
     .expect("absent Frameworks must not error");
   }
 
-  // --- locate_dev_backend_binary / locate_dev_app_bundle ---
+  // --- bundled and development backend lookup ---
+
+  #[test]
+  fn bundled_laufey_root_uses_versioned_sibling_directory() {
+    let exe = Path::new("build-root").join("bin").join("deno");
+    assert_eq!(
+      bundled_laufey_root_for_exe(&exe),
+      Some(
+        Path::new("build-root")
+          .join("bin")
+          .join("laufey")
+          .join(LAUFEY_VERSION)
+      )
+    );
+  }
+
+  #[test]
+  fn bundled_backend_dir_requires_exact_backend_and_target() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("laufey").join(LAUFEY_VERSION);
+    let expected = root.join("raw").join(LAUFEY_NATIVE_TARGET);
+    std::fs::create_dir_all(&expected).unwrap();
+    let binary = expected.join(if LAUFEY_NATIVE_TARGET.contains("windows") {
+      "laufey_winit.exe"
+    } else {
+      "laufey_winit"
+    });
+    std::fs::write(&binary, b"binary").unwrap();
+
+    assert_eq!(
+      bundled_backend_dir(Some(&root), "raw", LAUFEY_NATIVE_TARGET),
+      Some(expected.clone())
+    );
+    assert_eq!(
+      locate_backend_binary(&expected, "raw", LAUFEY_NATIVE_TARGET),
+      Some(binary)
+    );
+    assert!(
+      bundled_backend_dir(Some(&root), "webview", LAUFEY_NATIVE_TARGET)
+        .is_none()
+    );
+    assert!(bundled_backend_dir(Some(&root), "raw", "other-target").is_none());
+  }
 
   #[test]
   fn locate_dev_webview_returns_first_existing_candidate() {

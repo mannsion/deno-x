@@ -31,7 +31,7 @@ The closure body is the runtime entrypoint the backend calls after `init`.
 Version safety is two-layered:
 
 - **Compile time** (`lib.rs:47`):
-  `const _: () = assert!(laufey::LAUFEY_API_VERSION == 26, …)`. If the linked
+  `const _: () = assert!(laufey::LAUFEY_API_VERSION == 30, …)`. If the linked
   `laufey` crate's ABI version drifts from what the shipped backend speaks,
   `cargo build` fails loudly instead of producing a dylib that silently won't
   launch.
@@ -39,7 +39,8 @@ Version safety is two-layered:
   the backend binary version is pinned, and downloads are integrity-checked
   against in-repo SHA-256 digests (`cli/laufey_sums.lock`, `LAUFEY_PINNED_SUMS`)
   — no TOFU on the GitHub releases page. `LaufeyBackendResolver` resolves in
-  order: `LAUFEY_DEV_DIR` checkout → cached download → fresh download.
+  order: `LAUFEY_DEV_DIR` checkout → versioned backend bundled beside Deno →
+  cached download → fresh download.
 
 The dylib finds _itself_ on disk via `dladdr` on one of its own functions
 (`get_dylib_path`, `lib.rs:986`) — needed for the auto-update sentinel and for
