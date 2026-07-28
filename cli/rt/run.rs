@@ -1916,7 +1916,9 @@ pub async fn run_with_options(
 
     loop {
       let hmr_fut = hmr_runner.run();
-      let event_loop_fut = worker.run_event_loop(false);
+      // The local HMR inspector is blocking and must keep an otherwise-idle
+      // desktop runtime alive so it can receive future file changes.
+      let event_loop_fut = worker.run_event_loop(true);
 
       tokio::select! {
         hmr_result = hmr_fut => {
