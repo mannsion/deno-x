@@ -1,5 +1,6 @@
 // Copyright 2018-2026 the Deno authors. MIT license.
 
+use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -284,7 +285,7 @@ pub async fn sync_types_command(
   // project to discover every external (npm:/jsr:/http(s):) specifier the code
   // actually uses — including specifiers written directly in source and across
   // workspace members, not just those declared in the root import map.
-  let (graph_specifiers, local_wasm_modules) = {
+  let (graph_specifiers, preferred_type_specifiers, local_wasm_modules) = {
     let graph_container = factory.main_module_graph_container().await?;
     let roots = graph_container.collect_specifiers(
       &root_patterns,
@@ -358,6 +359,7 @@ pub async fn sync_types_command(
     };
 
     let mut specifiers = std::collections::BTreeSet::new();
+    let mut preferred_type_specifiers = BTreeMap::new();
     // Remote graph roots do not appear as a dependency edge, but still need to
     // be mirrored for stock TypeScript and included in its project.
     for root in &roots {
@@ -392,7 +394,7 @@ pub async fn sync_types_command(
         };
         local_wasm_modules.push((wasm.specifier.clone(), dts));
       }
-      for (raw, _dep) in module.dependencies() {
+      for (raw, dep) in module.dependencies() {
         // Collect scheme specifiers (npm:/jsr:/http:) and bare specifiers
         // (import-map aliases like `@std/fmt/colors`, `fresh/runtime`). Skip
         // relative imports and node: builtins. setup_npm_compat resolves the
@@ -404,10 +406,22 @@ pub async fn sync_types_command(
           continue;
         }
         specifiers.insert(raw.clone());
+
+        let execution_specifier = graph.resolve_dependency_from_dep(dep, false);
+        let type_specifier = graph.resolve_dependency_from_dep(dep, true);
+        if let (Some(execution_specifier), Some(type_specifier)) =
+          (execution_specifier, type_specifier)
+          && execution_specifier != type_specifier
+          && matches!(type_specifier.scheme(), "npm" | "jsr" | "http" | "https")
+        {
+          preferred_type_specifiers
+            .insert(raw.clone(), type_specifier.to_string());
+        }
       }
     }
     (
       specifiers.into_iter().collect::<Vec<_>>(),
+      preferred_type_specifiers,
       local_wasm_modules,
     )
   };
@@ -470,6 +484,7 @@ pub async fn sync_types_command(
     &http_client,
     &permissions,
     &graph_specifiers,
+    &preferred_type_specifiers,
     &local_wasm_modules,
     &npm_resolver,
     resolved_compiler_options.as_ref(),

@@ -1519,8 +1519,10 @@ fn path_relative_to_deno_dir(
     .map(|f| f.to_string_lossy())
     .unwrap_or_default();
 
-  if parent_name == "@jsr" {
-    Some(format!("../node_modules/@jsr/{pkg_name}/{package_path}"))
+  if parent_name.starts_with('@') {
+    Some(format!(
+      "../node_modules/{parent_name}/{pkg_name}/{package_path}"
+    ))
   } else {
     Some(format!("../node_modules/{pkg_name}/{package_path}"))
   }
@@ -2292,6 +2294,37 @@ interface AlsoKeep {
     assert_eq!(paths.get("chalk"), Some(&expected));
     assert_eq!(paths.get("npm:chalk"), Some(&expected));
     assert_eq!(paths.get("npm:chalk@5"), Some(&expected));
+  }
+
+  #[test]
+  fn test_generate_npm_paths_preserves_scoped_package_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let pkg_dir = dir.path().join("node_modules/@types/react");
+    std::fs::create_dir_all(&pkg_dir).unwrap();
+    std::fs::write(
+      pkg_dir.join("package.json"),
+      serde_json::to_string(&json!({
+        "exports": {
+          "./jsx-runtime": {
+            "types": "./jsx-runtime.d.ts",
+          },
+        },
+      }))
+      .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(pkg_dir.join("jsx-runtime.d.ts"), "export {};\n").unwrap();
+    let imports = json!({
+      "react/jsx-runtime": "npm:/@types/react@18.3.10/jsx-runtime",
+    });
+
+    let paths =
+      generate_npm_paths(dir.path(), Some(&imports), &BTreeMap::new());
+
+    assert_eq!(
+      paths.get("react/jsx-runtime"),
+      Some(&json!(["../node_modules/@types/react/jsx-runtime.d.ts"]))
+    );
   }
 
   #[test]

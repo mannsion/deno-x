@@ -283,6 +283,7 @@ pub async fn setup_npm_compat(
   http_client: &HttpClient,
   permissions: &PermissionsContainer,
   graph_specifiers: &[String],
+  preferred_type_specifiers: &BTreeMap<String, String>,
   local_wasm_modules: &[(Url, String)],
   npm_resolver: &CliNpmResolver,
   resolved_compiler_options: Option<&Value>,
@@ -352,6 +353,11 @@ pub async fn setup_npm_compat(
         .entry(spec.clone())
         .or_insert(Value::String(resolved));
     }
+  }
+  // Stock TypeScript cannot consume Deno's separate type resolutions. Encode
+  // graph-selected `@ts-types` and `jsxImportSourceTypes` targets in `paths`.
+  for (specifier, type_specifier) in preferred_type_specifiers {
+    combined.insert(specifier.clone(), Value::String(type_specifier.clone()));
   }
 
   // Always generate the base config: even a project with no external deps needs
